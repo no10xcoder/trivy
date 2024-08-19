@@ -1,6 +1,7 @@
 package mod
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strings"
 	"unicode"
 
 	"github.com/samber/lo"
@@ -97,8 +99,12 @@ func (a *gomodAnalyzer) PostAnalyze(_ context.Context, input analyzer.PostAnalys
 		return nil, xerrors.Errorf("walk error: %w", err)
 	}
 
-	if err = a.fillAdditionalData(apps); err != nil {
-		a.logger.Warn("Unable to collect additional info", log.Err(err))
+	if err = a.fillAdditionalGoVendorData(apps, input.FS); err != nil {
+		a.logger.Warn("Unable to collect additional Go vendor info", log.Err(err))
+	}
+
+	if err = a.fillAdditionalGoModData(apps); err != nil {
+		a.logger.Warn("Unable to collect additional Go Mod info", log.Err(err))
 	}
 
 	return &analyzer.AnalysisResult{
@@ -108,6 +114,12 @@ func (a *gomodAnalyzer) PostAnalyze(_ context.Context, input analyzer.PostAnalys
 
 func (a *gomodAnalyzer) Required(filePath string, _ os.FileInfo) bool {
 	fileName := filepath.Base(filePath)
+
+	// Include license files in vendor folder.
+	if strings.HasPrefix(filePath, "vendor/") && licenseRegexp.MatchString(fileName) {
+		return true
+	}
+
 	return slices.Contains(requiredFiles, fileName)
 }
 
@@ -119,8 +131,8 @@ func (a *gomodAnalyzer) Version() int {
 	return version
 }
 
-// fillAdditionalData collects licenses and dependency relationships, then update applications.
-func (a *gomodAnalyzer) fillAdditionalData(apps []types.Application) error {
+// fillAdditionalGoModData collects licenses and dependency relationships, then update applications.
+func (a *gomodAnalyzer) fillAdditionalGoModData(apps []types.Application) error {
 	gopath := os.Getenv("GOPATH")
 	if gopath == "" {
 		gopath = build.Default.GOPATH
@@ -151,7 +163,7 @@ func (a *gomodAnalyzer) fillAdditionalData(apps []types.Application) error {
 			modDir := filepath.Join(modPath, fmt.Sprintf("%s@v%s", normalizeModName(lib.Name), lib.Version))
 
 			// Collect licenses
-			if licenseNames, err := findLicense(modDir, a.licenseClassifierConfidenceLevel); err != nil {
+			if licenseNames, err := findGoModLicense(modDir, a.licenseClassifierConfidenceLevel); err != nil {
 				return xerrors.Errorf("license error: %w", err)
 			} else {
 				// Cache the detected licenses
@@ -179,6 +191,43 @@ func (a *gomodAnalyzer) fillAdditionalData(apps []types.Application) error {
 			}
 		}
 	}
+	return nil
+}
+
+// fillAdditionalGoVendorData collects licenses and dependency relationships, then update applications.
+func (a *gomodAnalyzer) fillAdditionalGoVendorData(apps []types.Application, fsys fs.FS) error {
+	_, err := fs.Stat(fsys, "./vendor")
+	if errors.Is(err, os.ErrNotExist) {
+		a.logger.Debug("The vendor folder was not found. Need vendored modules to fill licenses")
+		return nil
+	}
+
+	licenses := make(map[string][]string)
+	for i, app := range apps {
+		for j, lib := range app.Packages {
+			if l, ok := licenses[lib.ID]; ok {
+				// Fill licenses
+				apps[i].Packages[j].Licenses = l
+				continue
+			}
+
+			// e.g. vendor/github.com/aquasecurity/go-dep-parser
+			// Note: vendored modules don't have their name normalized!
+			modDir := filepath.Join("vendor", lib.Name)
+
+			// Collect licenses
+			if licenseNames, err := findVendorLicense(fsys, modDir, a.licenseClassifierConfidenceLevel); err != nil {
+				return xerrors.Errorf("license error: %w", err)
+			} else {
+				// Cache the detected licenses
+				licenses[lib.ID] = licenseNames
+
+				// Fill licenses
+				apps[i].Packages[j].Licenses = licenseNames
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -264,7 +313,7 @@ func mergeGoSum(gomod, gosum *types.Application) {
 	gomod.Packages = lo.Values(uniq)
 }
 
-func findLicense(dir string, classifierConfidenceLevel float64) ([]string, error) {
+func findGoModLicense(dir string, classifierConfidenceLevel float64) ([]string, error) {
 	var license *types.LicenseFile
 	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -283,6 +332,50 @@ func findLicense(dir string, classifierConfidenceLevel float64) ([]string, error
 		defer f.Close()
 
 		l, err := licensing.Classify(path, f, classifierConfidenceLevel)
+		if err != nil {
+			return xerrors.Errorf("license classify error: %w", err)
+		}
+		// License found
+		if l != nil && len(l.Findings) > 0 {
+			license = l
+			return io.EOF
+		}
+		return nil
+	})
+
+	switch {
+	// The module path may not exist
+	case errors.Is(err, os.ErrNotExist):
+		return nil, nil
+	case err != nil && !errors.Is(err, io.EOF):
+		return nil, fmt.Errorf("finding a known open source license: %w", err)
+	case license == nil || len(license.Findings) == 0:
+		return nil, nil
+	}
+
+	return license.Findings.Names(), nil
+}
+
+func findVendorLicense(fsys fs.FS, dir string, classifierConfidenceLevel float64) ([]string, error) {
+	var license *types.LicenseFile
+	err := fs.WalkDir(fsys, dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		} else if !d.Type().IsRegular() {
+			return nil
+		}
+
+		if !licenseRegexp.MatchString(filepath.Base(path)) {
+			return nil
+		}
+
+		// e.g. vendor/github.com/aquasecurity/go-dep-parser
+		fileData, err := fs.ReadFile(fsys, path)
+		if err != nil {
+			return xerrors.Errorf("file (%s) open error: %w", path, err)
+		}
+
+		l, err := licensing.Classify(path, bytes.NewBuffer(fileData), classifierConfidenceLevel)
 		if err != nil {
 			return xerrors.Errorf("license classify error: %w", err)
 		}
