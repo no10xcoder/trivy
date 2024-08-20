@@ -214,6 +214,11 @@ func (a *gomodAnalyzer) fillAdditionalGoVendorData(apps []types.Application, fsy
 			// e.g. vendor/github.com/aquasecurity/go-dep-parser
 			// Note: vendored modules don't have their name normalized!
 			modDir := filepath.Join("vendor", lib.Name)
+			if lib.Replaces != nil {
+				// When a module is replaced, it is stored under the original
+				// module path.
+				modDir = filepath.Join("vendor", lib.Replaces.Name)
+			}
 
 			// Collect licenses
 			if licenseNames, err := findVendorLicense(fsys, modDir, a.licenseClassifierConfidenceLevel); err != nil {

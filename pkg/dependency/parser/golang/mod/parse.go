@@ -143,6 +143,7 @@ func (p *Parser) Parse(r xio.ReadSeekerAt) ([]ftypes.Package, []ftypes.Dependenc
 				Version:            rep.New.Version[1:],
 				Relationship:       old.Relationship,
 				ExternalReferences: p.GetExternalRefs(rep.New.Path),
+				Replaces:           &old,
 			}
 		}
 	}

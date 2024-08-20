@@ -193,6 +193,8 @@ type Package struct {
 	Modularitylabel string     `json:",omitempty"` // only for Red Hat based distributions
 	BuildInfo       *BuildInfo `json:",omitempty"` // only for Red Hat
 
+	Replaces *Package `json:",omitempty"` // only for Go. To track the original package.
+
 	Indirect     bool         `json:",omitempty"` // Deprecated: Use relationship. Kept for backward compatibility.
 	Relationship Relationship `json:",omitempty"`
 
